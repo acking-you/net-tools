@@ -18,6 +18,10 @@ use tracing::{Instrument, debug, info_span, trace};
 mod current_mapping;
 mod mapping;
 mod metrics;
+mod observer;
+#[cfg(test)]
+mod observer_tests;
+pub use observer::{Event, MappingProtocol, Observer};
 mod nat_pmp;
 mod pcp;
 mod upnp;
@@ -86,6 +90,9 @@ pub enum ProbeError {
 
 #[derive(derive_more::Debug)]
 enum Message {
+    Deactivate {
+        done: oneshot::Sender<()>,
+    },
     /// Attempt to get a mapping if the local port is set but there is no mapping.
     ProcureMapping,
     /// Request to update the local port.
@@ -93,7 +100,9 @@ enum Message {
     /// The resulting external address can be obtained subscribing using
     /// [`Client::watch_external_address`].
     /// A value of `None` will deactivate port mapping.
-    UpdateLocalPort { local_port: Option<NonZeroU16> },
+    UpdateLocalPort {
+        local_port: Option<NonZeroU16>,
+    },
     /// Request to probe the port mapping protocols.
     ///
     /// The requester should wait for the result at the [`oneshot::Receiver`] counterpart of the
@@ -168,9 +177,15 @@ impl Client {
 
     /// Creates a new port mapping client with a previously created metrics collector.
     pub fn with_metrics(config: Config, metrics: Arc<Metrics>) -> Self {
+        Self::with_observer(config, metrics, Observer::default())
+    }
+
+    /// Create a client whose discovery, lease and release transitions are observed.
+    pub fn with_observer(config: Config, metrics: Arc<Metrics>, observer: Observer) -> Self {
         let (service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
 
-        let (service, watcher) = Service::new(config, service_rx, metrics.clone());
+        let (mut service, watcher) = Service::new(config, service_rx, metrics.clone());
+        service.observer = observer;
 
         let handle = AbortOnDropHandle::new(tokio::spawn(
             async move { service.run().await }.instrument(info_span!("portmapper.service")),
@@ -240,6 +255,20 @@ impl Client {
             .try_send(Message::UpdateLocalPort { local_port: None })
         {
             trace!("Failed to deactivate port mapping {e}")
+        }
+    }
+
+    /// Deactivate and acknowledge completion of lease cleanup. Observer events
+    /// distinguish successful release from a gateway error.
+    pub async fn deactivate_and_wait(&self) {
+        let (done, waiting) = oneshot::channel();
+        if self
+            .service_tx
+            .send(Message::Deactivate { done })
+            .await
+            .is_ok()
+        {
+            let _ = waiting.await;
         }
     }
 
@@ -434,6 +463,7 @@ type ProbeResult = Result<ProbeOutput, ProbeError>;
 #[derive(Debug)]
 pub struct Service {
     config: Config,
+    observer: Observer,
     /// Local port to map.
     local_port: Option<NonZeroU16>,
     /// Channel over which the service is informed of messages.
@@ -474,6 +504,7 @@ impl Service {
         }
         let service = Service {
             config,
+            observer: Observer::default(),
             local_port: None,
             rx,
             current_mapping,
@@ -488,10 +519,25 @@ impl Service {
 
     /// Clears the current mapping and releases it.
     async fn invalidate_mapping(&mut self) {
-        if let Some(old_mapping) = self.current_mapping.update(None)
-            && let Err(e) = old_mapping.release().await
-        {
-            debug!("failed to release mapping {e}");
+        if let Some(old_mapping) = self.current_mapping.update(None) {
+            use mapping::PortMapped;
+            let (ip, port) = old_mapping.external();
+            let external = SocketAddrV4::new(ip, port.get());
+            let confirmed = matches!(&old_mapping, mapping::Mapping::Upnp(_));
+            self.observer.emit(Event::Releasing(external));
+            match old_mapping.release().await {
+                Ok(()) => self.observer.emit(Event::Released {
+                    external,
+                    confirmed,
+                }),
+                Err(e) => {
+                    debug!("failed to release mapping {e}");
+                    self.observer.emit(Event::ReleaseFailed {
+                        external,
+                        error: observer::detail(e),
+                    });
+                }
+            }
         }
     }
 
@@ -529,7 +575,11 @@ impl Service {
                 Some(event) = self.current_mapping.next() => {
                     trace!("tick: mapping event {event:?}");
                     match event {
-                        current_mapping::Event::Renew { external_ip, external_port } | current_mapping::Event::Expired { external_ip, external_port } => {
+                        current_mapping::Event::Renew { external_ip, external_port } => {
+                            self.get_mapping(Some((external_ip, external_port)));
+                        },
+                        current_mapping::Event::Expired { external_ip, external_port } => {
+                            self.observer.emit(Event::Expired(SocketAddrV4::new(external_ip, external_port.get())));
                             self.get_mapping(Some((external_ip, external_port)));
                         },
                     }
@@ -553,6 +603,12 @@ impl Service {
             trace!(?output, "probe output");
             output
         });
+        match &result {
+            Ok(output) => self.observer.emit(Event::Discovered(output.clone())),
+            Err(error) => self
+                .observer
+                .emit(Event::DiscoveryFailed(observer::detail(error))),
+        }
         for tx in receivers {
             // ignore the error. If the receiver is no longer there we don't really care
             let _ = tx.send(result.clone());
@@ -565,21 +621,42 @@ impl Service {
     ) {
         match result {
             Ok(Ok(mapping)) => {
+                use mapping::PortMapped;
+                let protocol = match &mapping {
+                    mapping::Mapping::Pcp(_) => MappingProtocol::Pcp,
+                    mapping::Mapping::NatPmp(_) => MappingProtocol::NatPmp,
+                    mapping::Mapping::Upnp(_) => MappingProtocol::Upnp,
+                };
+                let (ip, port) = mapping.external();
+                self.observer.emit(Event::Active {
+                    protocol,
+                    external: SocketAddrV4::new(ip, port.get()),
+                    lifetime: mapping.half_lifetime().saturating_mul(2),
+                });
                 self.current_mapping.update(Some(mapping));
             }
             Ok(Err(e)) => {
                 debug!("failed to get a port mapping {e}");
                 self.metrics.mapping_failures.inc();
+                self.observer
+                    .emit(Event::MappingFailed(observer::detail(e)));
             }
             Err(e) => {
                 debug!("failed to get a port mapping {e}");
                 self.metrics.mapping_failures.inc();
+                self.observer
+                    .emit(Event::MappingFailed(observer::detail(e)));
             }
         }
     }
 
     async fn handle_msg(&mut self, msg: Message) {
         match msg {
+            Message::Deactivate { done } => {
+                self.update_local_port(None).await;
+                self.probing_task = None;
+                let _ = done.send(());
+            }
             Message::ProcureMapping => self.update_local_port(self.local_port).await,
             Message::UpdateLocalPort { local_port } => self.update_local_port(local_port).await,
             Message::Probe { result_tx } => self.probe_request(result_tx),
@@ -605,6 +682,7 @@ impl Service {
                 .unwrap_or_default();
 
             if did_cancel {
+                self.observer.emit(Event::Cancelled);
                 debug!(
                     "canceled mapping task due to local port update. Old: {:?} New: {:?}",
                     old_port, self.local_port
@@ -635,7 +713,11 @@ impl Service {
 
             let (local_ip, gateway) = match ip_and_gateway() {
                 Ok(ip_and_gw) => ip_and_gw,
-                Err(e) => return debug!("can't get mapping: {e}"),
+                Err(e) => {
+                    self.observer
+                        .emit(Event::MappingFailed(observer::detail(&e)));
+                    return debug!("can't get mapping: {e}");
+                }
             };
 
             let ProbeOutput { upnp, pcp, nat_pmp } = self.full_probe.output();
@@ -644,84 +726,70 @@ impl Service {
             let recently_probed =
                 self.full_probe.last_probe + UNAVAILABILITY_TRUST_DURATION > Instant::now();
             let protocol = self.config.protocol;
-            // strategy:
-            // 1. check the available services and prefer pcp, then nat_pmp then upnp since it's
-            //    the most unreliable, but possibly the most deployed one
-            // 2. if no service was available, fallback to upnp if enabled, followed by pcp and
-            //    nat_pmp
-            self.mapping_task = if pcp {
-                // try pcp if available first
-                let task = mapping::Mapping::new_pcp(
-                    protocol,
-                    local_ip,
-                    local_port,
-                    gateway,
-                    external_addr,
-                );
-                Some(AbortOnDropHandle::new(tokio::spawn(
-                    task.instrument(info_span!("pcp")),
-                )))
+            // Prefer discovered PCP, NAT-PMP, then UPnP. Without a recent
+            // probe, preserve the configured fallback order.
+            let selected = if pcp {
+                MappingProtocol::Pcp
             } else if nat_pmp {
-                // next nat_pmp if available
-                let task = mapping::Mapping::new_nat_pmp(
-                    protocol,
-                    local_ip,
-                    local_port,
-                    gateway,
-                    external_addr,
-                );
-                Some(AbortOnDropHandle::new(tokio::spawn(
-                    task.instrument(info_span!("pmp")),
-                )))
+                MappingProtocol::NatPmp
             } else if upnp || self.config.enable_upnp {
-                // next upnp if available or enabled
-                let external_port = external_addr.map(|(_addr, port)| port);
-                let gateway = self
-                    .full_probe
-                    .last_upnp_gateway_addr
-                    .as_ref()
-                    .map(|(gateway, _last_seen)| gateway.clone());
-                let task = mapping::Mapping::new_upnp(
-                    protocol,
-                    local_ip,
-                    local_port,
-                    gateway,
-                    external_port,
-                );
-
-                Some(AbortOnDropHandle::new(tokio::spawn(
-                    task.instrument(info_span!("upnp")),
-                )))
+                MappingProtocol::Upnp
             } else if !recently_probed && self.config.enable_pcp {
-                // if no service is available and the default fallback (upnp) is disabled, try pcp
-                // first
-                let task = mapping::Mapping::new_pcp(
-                    protocol,
-                    local_ip,
-                    local_port,
-                    gateway,
-                    external_addr,
-                );
-
-                Some(AbortOnDropHandle::new(tokio::spawn(
-                    task.instrument(info_span!("pcp")),
-                )))
+                MappingProtocol::Pcp
             } else if !recently_probed && self.config.enable_nat_pmp {
-                // finally try nat_pmp if enabled
-                let task = mapping::Mapping::new_nat_pmp(
-                    protocol,
-                    local_ip,
-                    local_port,
-                    gateway,
-                    external_addr,
-                );
-                Some(AbortOnDropHandle::new(tokio::spawn(
-                    task.instrument(info_span!("pmp")),
-                )))
+                MappingProtocol::NatPmp
             } else {
-                // give up
+                self.observer
+                    .emit(Event::MappingFailed("no supported mapping protocol".into()));
                 return;
-            }
+            };
+            self.observer.emit(Event::Requesting {
+                protocol: selected,
+                gateway,
+                renewal: self.current_mapping.external().is_some(),
+            });
+            let upnp_gateway = self
+                .full_probe
+                .last_upnp_gateway_addr
+                .as_ref()
+                .map(|(gateway, _)| gateway.clone());
+            self.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(
+                async move {
+                    match selected {
+                        MappingProtocol::Pcp => {
+                            mapping::Mapping::new_pcp(
+                                protocol,
+                                local_ip,
+                                local_port,
+                                gateway,
+                                external_addr,
+                            )
+                            .await
+                        }
+                        MappingProtocol::NatPmp => {
+                            mapping::Mapping::new_nat_pmp(
+                                protocol,
+                                local_ip,
+                                local_port,
+                                gateway,
+                                external_addr,
+                            )
+                            .await
+                        }
+                        MappingProtocol::Upnp => {
+                            mapping::Mapping::new_upnp(
+                                protocol,
+                                local_ip,
+                                local_port,
+                                upnp_gateway,
+                                external_addr.map(|(_, port)| port),
+                            )
+                            .await
+                        }
+                    }
+                }
+                .instrument(info_span!("mapping", ?selected)),
+            )));
         }
     }
 
@@ -736,20 +804,26 @@ impl Service {
             None => {
                 let probe_output = self.full_probe.output();
                 if probe_output.all_available() {
+                    self.observer.emit(Event::Discovered(probe_output.clone()));
                     // we don't care if the requester is no longer there
                     let _ = result_tx.send(Ok(probe_output));
                 } else {
                     self.metrics.probes_started.inc();
+                    self.observer.emit(Event::Discovering);
 
                     let (local_ip, gateway) = match ip_and_gateway() {
                         Ok(ip_and_gw) => ip_and_gw,
                         Err(e) => {
                             // there is no guarantee this will be displayed, so log it anyway
                             debug!("could not start probe: {e}");
+                            self.observer
+                                .emit(Event::DiscoveryFailed(observer::detail(&e)));
                             let _ = result_tx.send(Err(e));
                             return;
                         }
                     };
+
+                    self.observer.emit(Event::Gateway { local_ip, gateway });
 
                     let config = self.config.clone();
                     let metrics = self.metrics.clone();
